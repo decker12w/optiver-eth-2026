@@ -187,11 +187,21 @@ class Client:
                 self.e.delete_orders(i)
 
     def quote(self, iid, bid_price, ask_price, size):
-        """Replace our quotes on iid with a fresh bid/ask pair."""
-        self.cancel_all(iid)
-        b = self.buy(iid, bid_price, size) if bid_price is not None else None
-        a = self.sell(iid, ask_price, size) if ask_price is not None else None
-        return b, a
+        """Keep one bid and one ask on iid. A side is only cancelled/reinserted when
+        its target price changed, so we save rate limit and keep queue priority.
+        Pass None for a side to pull it. Returns (bid_order_id, ask_order_id)."""
+        out = self.e.get_outstanding_orders(iid)
+        ids = {}
+        for side, px in (("bid", bid_price), ("ask", ask_price)):
+            mine = [o for o in out.values() if o.side == side]
+            target = self.round_price(iid, px, side) if px is not None else None
+            if target is not None and len(mine) == 1 and abs(mine[0].price - target) < 1e-9:
+                ids[side] = mine[0].order_id      # unchanged: leave it resting
+                continue
+            for o in mine:
+                self.cancel(iid, o.order_id)
+            ids[side] = self.order(iid, side, px, size) if px is not None else None
+        return ids["bid"], ids["ask"]
 
     def take(self, iid, side, volume, slippage_ticks=0):
         """Aggress the book with an IOC at best price (+/- slippage)."""
@@ -301,46 +311,83 @@ def run(exchange, strategy: Strategy):
 # ============================== MOCK EXCHANGE ==============================
 class MockExchange:
     """Offline stand-in with the same method names/return shapes as optibook.
-    Two correlated stocks (dual listing style) on a random walk. Limit orders fill
-    when the market crosses them; IOC fills against the top of book."""
 
-    def __init__(self, ids=("STOCK_A", "STOCK_B"), tick=0.1):
+    Dual-listing setup: both instruments track the same fair value (+ small noise).
+      STOCK_A - liquid: tight spread, deep book, IOCs fill in full.
+      STOCK_B - illiquid: wide spread, thin book, IOCs fill only up to MAX_IOC.
+    Our resting limit orders fill when (a) the market moves through them, or
+    (b) a random taker arrives and our price is at or better than the market's best.
+    `ops` counts inserts/cancels so you can check rate-limit usage."""
+
+    SPECS = {
+        "STOCK_A": dict(half_spread=0.1, taker_prob=0.30, depth=(80, 200), max_ioc=10_000),
+        "STOCK_B": dict(half_spread=0.5, taker_prob=0.15, depth=(5, 20), max_ioc=20),
+    }
+
+    def __init__(self, tick=0.1):
         self.tick = tick
-        self.ids = ids
+        self.specs = self.SPECS
+        self.ids = tuple(self.specs)
         self.fair = 100.0
-        self.offset = {i: 0.0 for i in ids}
-        self.pos = {i: 0 for i in ids}
+        self.offset = {i: 0.0 for i in self.ids}
+        self.pos = {i: 0 for i in self.ids}
         self.cash = 0.0
-        self.orders = {i: {} for i in ids}
-        self.new_trades = {i: [] for i in ids}
+        self.orders = {i: {} for i in self.ids}
+        self.new_trades = {i: [] for i in self.ids}
         self.next_id = 1
+        self.ops = 0
         self.connected = False
 
+    # ---------- price model ----------
     def _r(self, x):
         return round(round(x / self.tick) * self.tick, 10)
 
     def _bb(self, i):
-        return self._r(self.fair + self.offset[i] - 0.15)
+        return self._r(self.fair + self.offset[i] - self.specs[i]["half_spread"])
 
     def _ba(self, i):
-        return self._r(self.fair + self.offset[i] + 0.15)
+        return self._r(self.fair + self.offset[i] + self.specs[i]["half_spread"])
 
     def _step(self):
-        self.fair += random.gauss(0, 0.05)
-        for i in self.ids:
-            self.offset[i] = 0.9 * self.offset[i] + random.gauss(0, 0.05)
-            for oid, o in list(self.orders[i].items()):
-                if (o.side == "bid" and self._ba(i) <= o.price) or (o.side == "ask" and self._bb(i) >= o.price):
-                    self._fill(i, o.side, o.price, o.volume, oid)
-                    del self.orders[i][oid]
+        self.fair += random.gauss(0, 0.03)
+        for i, s in self.specs.items():
+            self.offset[i] = 0.8 * self.offset[i] + random.gauss(0, 0.02)
+            bb, ba = self._bb(i), self._ba(i)
+            # (a) market moved through our resting orders
+            for o in list(self.orders[i].values()):
+                if (o.side == "bid" and ba <= o.price) or (o.side == "ask" and bb >= o.price):
+                    self._fill_resting(i, o, o.volume)
+            # (b) random taker hits the best price; we fill first if we are at/inside it
+            if random.random() < s["taker_prob"]:
+                vol = random.randint(1, 10)
+                if random.random() < 0.5:   # taker buys -> lifts asks
+                    hit = sorted((o for o in self.orders[i].values() if o.side == "ask" and o.price <= ba),
+                                 key=lambda o: o.price)
+                else:                       # taker sells -> hits bids
+                    hit = sorted((o for o in self.orders[i].values() if o.side == "bid" and o.price >= bb),
+                                 key=lambda o: -o.price)
+                for o in hit:
+                    if vol <= 0:
+                        break
+                    q = min(vol, o.volume)
+                    self._fill_resting(i, o, q)
+                    vol -= q
 
-    def _fill(self, i, side, price, vol, oid):
+    # ---------- fills ----------
+    def _trade(self, i, side, price, vol, oid):
         sgn = 1 if side == "bid" else -1
         self.pos[i] += sgn * vol
         self.cash -= sgn * vol * price
         self.new_trades[i].append(NS(timestamp=time.time(), order_id=oid, trade_id=oid, instrument_id=i,
                                      price=price, volume=vol, side=side))
 
+    def _fill_resting(self, i, o, q):
+        self._trade(i, o.side, o.price, q, o.order_id)
+        o.volume -= q
+        if o.volume <= 0:
+            self.orders[i].pop(o.order_id, None)
+
+    # ---------- optibook interface ----------
     def connect(self): self.connected = True
     def disconnect(self): self.connected = False
     def is_connected(self): return self.connected
@@ -348,30 +395,37 @@ class MockExchange:
     def get_instruments(self):
         return {i: NS(instrument_id=i, tick_size=self.tick, instrument_type="STOCK") for i in self.ids}
 
-    get_tradable_instruments = get_instruments
+    def get_tradable_instruments(self):
+        self._step()                # called once per Client.refresh() -> one market step per loop
+        return self.get_instruments()
 
     def get_last_price_book(self, i):
-        self._step()
-        bb, ba = self._bb(i), self._ba(i)
+        bb, ba, (lo, hi) = self._bb(i), self._ba(i), self.specs[i]["depth"]
         return NS(instrument_id=i, timestamp=time.time(),
-                  bids=[NS(price=self._r(bb - k * self.tick), volume=random.randint(10, 60)) for k in range(3)],
-                  asks=[NS(price=self._r(ba + k * self.tick), volume=random.randint(10, 60)) for k in range(3)])
+                  bids=[NS(price=self._r(bb - k * self.tick), volume=random.randint(lo, hi)) for k in range(3)],
+                  asks=[NS(price=self._r(ba + k * self.tick), volume=random.randint(lo, hi)) for k in range(3)])
 
     def insert_order(self, i, *, price, volume, side, order_type="limit"):
+        self.ops += 1
         oid = self.next_id
         self.next_id += 1
         if order_type == "ioc":
-            if (side == "bid" and price >= self._ba(i)) or (side == "ask" and price <= self._bb(i)):
-                self._fill(i, side, self._ba(i) if side == "bid" else self._bb(i), volume, oid)
+            best = self._ba(i) if side == "bid" else self._bb(i)
+            if (side == "bid" and price >= best) or (side == "ask" and price <= best):
+                self._trade(i, side, best, min(volume, self.specs[i]["max_ioc"]), oid)
         else:
             self.orders[i][oid] = NS(order_id=oid, instrument_id=i, price=price, volume=volume, side=side)
         return NS(success=True, order_id=oid, error_reason=None)
 
     def delete_order(self, i, *, order_id):
+        self.ops += 1
         ok = self.orders[i].pop(order_id, None) is not None
         return NS(success=ok, error_reason=None if ok else "unknown order")
 
-    def delete_orders(self, i): self.orders[i].clear()
+    def delete_orders(self, i):
+        self.ops += 1
+        self.orders[i].clear()
+
     def get_outstanding_orders(self, i): return dict(self.orders[i])
 
     def poll_new_trades(self, i):

@@ -19,7 +19,7 @@ optibook_bot.py                # Everything lives here
   Recorder                     # PnL/position logging, CSV export via Exporter
   Strategy                     # Trading logic — on_start / on_tick / on_stop
   run()                        # Main loop: reconnect → refresh → kill switch → on_tick → log
-  MockExchange                 # Offline exchange with the same interface (STOCK_A, STOCK_B)
+  MockExchange                 # Offline dual-listing exchange: STOCK_A liquid, STOCK_B illiquid; ex.ops counts messages
 exports/                       # CSVs written by Exporter (fills.csv, pnl.csv)
 CLAUDE.md
 ```
