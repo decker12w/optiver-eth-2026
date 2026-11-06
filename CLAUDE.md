@@ -2,54 +2,65 @@
 
 ## Project Overview
 
-Automated trading bot for **Optiver's coding competition** at ETH Zurich (6 Nov 2026). Teams trade on the **Optibook** exchange (https://2026-eth.optibook.net/) and are ranked by PnL. Infra is pre-built; on event day only the strategy is written.
+Automated trading bot for **Optiver's coding competition** at ETH Zurich (6 Nov 2026). Teams trade on the **Optibook** exchange (https://2026-eth.optibook.net/, API docs at /docs) and are ranked by PnL and by how well the strategy is built. The infrastructure in `bot/` is strategy-agnostic; strategies are drop-in files in `strategies/`.
 
 ## Tech Stack
 
-- **Python 3.10+** — single-file bot
-- **optibook** — Optiver's exchange client (`synchronous_client.Exchange`, `exporter.Exporter`), provided by the platform
-- **Standard library only** otherwise (no extra dependencies)
+- **Python 3.9+** (tested on 3.9 and 3.15); standard library only
+- **optibook**: Optiver's client (`synchronous_client.Exchange`, `exporter.Exporter`), installed on the platform. Not needed for `--mock`
 
 ## Project Structure
 
 ```
-optibook_bot.py                # Everything lives here
-  CONFIG                       # Limits, throttles, kill switch, exchange kwargs (top of file)
-  Client                       # Wrapper over Exchange: cached state + risk-checked order helpers
-  Recorder                     # PnL/position logging, CSV export via Exporter
-  Strategy                     # Trading logic — on_start / on_tick / on_stop
-  run()                        # Main loop: reconnect → refresh → kill switch → on_tick → log
-  MockExchange                 # Offline dual-listing exchange: STOCK_A liquid, STOCK_B illiquid; ex.ops counts messages
-exports/                       # CSVs written by Exporter (fills.csv, pnl.csv)
-CLAUDE.md
+bot/                     infrastructure: change only when something is broken
+  __main__.py            CLI: python -m bot ...
+  engine.py              Engine (main loop, reconnect, kill switch, shutdown) + run()
+  strategy.py            Strategy base class + Context (the only API strategies use)
+  market.py              MarketData: books (ex-own), public trades, social posts, instruments
+  account.py             Account: positions, cash, resting orders + owners, per-strategy Ledger
+  gateway.py             OrderGateway (the single path to the exchange) + Throttle
+  risk.py                RiskManager (pre-trade checks) + KillSwitch
+  models.py              Book, Level, Order, BID/ASK, round_to_tick
+  reporting.py           logging setup, status line, CSV exports
+  settings.py            Settings: every limit/interval in one place
+  loader.py              discovers strategies/<name>.py
+  mock.py                MockExchange: offline dual listing (PHILIPS_A liquid, PHILIPS_B illiquid)
+strategies/              one file = one strategy, named after the file; "_" files are ignored
+  _template.py           start here
+  example_signals.py     demo: publishes fair values in ctx.shared, logs news
+  example_quoter.py      demo: quotes around fair value
+tests/test_bot.py        unittest suite against the mock
+exports/ exports_mock/   CSV output (git-ignored)
 ```
 
 ## Key Commands
 
 ```bash
-python optibook_bot.py --mock  # Run against the offline mock exchange
-python optibook_bot.py         # Run against the real exchange (needs `optibook` installed)
-# Ctrl+C                       # Stop: cancels all outstanding orders, prints final PnL
+python -m bot --list                                    # strategies and whether they load
+python -m bot -s my_strategy --mock --duration 60       # offline
+python -m bot -s my_strategy                            # live (needs optibook)
+python -m bot -s signals,execution                      # combine; they tick in this order
+python -m unittest discover -s tests                    # tests
+# Ctrl+C (or SIGTERM): on_stop -> cancel all orders -> final PnL -> disconnect
 ```
 
 ## Code Style & Conventions
 
-- **Strategy goes in `Strategy.on_tick` only** — infra changes only when something is broken
-- **All orders go through `Client`** (`buy`, `sell`, `quote`, `take`, `flatten`, `cancel_all`) — never call `c.e.insert_order` directly, it bypasses position-limit checks
-- **Prices** are rounded to tick by `Client.round_price` (bids down, asks up)
-- **Config** values live as constants at the top of `optibook_bot.py`
-- **Language**: code and comments in English
-- **Changes**: smallest change that solves the problem; no unrequested refactors
+- **Strategy logic goes in `strategies/<name>.py` only.** Never edit `bot/` to add a strategy
+- **Strategies only use `ctx`**: they never get the `Exchange` object, so they cannot skip risk checks or steal polled data
+- **Per-tick flow**: account.sync → market.refresh → poll fills → kill switch → each `on_tick` in order → report
+- **Errors**: programming mistakes raise `ValueError`; exchange or network failures return `None`/`False` and are logged. A strategy that raises has its orders cancelled and runs again next tick
+- **Config** lives in `bot/settings.py` (`Settings`); strategy parameters are class attributes in the strategy file
+- Code and comments in English; smallest change that solves the problem; no unrequested refactors
 
-## Important Notes
+## Important Notes (from the Optibook docs)
 
-- **One connection per username** — only one teammate can run the bot at a time per account
-- **Sides**: `'bid'` = buy, `'ask'` = sell. **Order types**: `'limit'` or `'ioc'`
-- **`insert_order`** returns `success`, `order_id`, `error_reason` — always check `success`
-- **`amend_order`** changes volume only; to change price, delete and reinsert
-- **`poll_new_trades` / `poll_new_trade_ticks`** return only new items per instrument since the last call — `Client.refresh()` already calls them once per loop; read results from `c.fills`, `c.ticks`
-- **PnL**: `get_pnl()` without valuations uses the last public trade (noisy); `Client.pnl()` passes mids instead
-- **Instrument types**: `STOCK`, `STOCK_FUTURE`, `STOCK_OPTION`, `INDEX_FUTURE`, `INDEX_OPTION`, `INDEX_TRACKING_ETF` — expect relationships via `base_instrument_id`, `index_constituents`, `etf_multiplier`, `strike`, `expiry`
-- **Social media feed** (`poll_new_social_media_feeds`) may drive price moves
-- **Kill switch**: below `KILL_PNL` the bot cancels everything, flattens and stops trading
-- **To confirm at tutorial**: position limits, exchange rate limits, how `Exchange()` is configured, instrument relationships, scoring rule
+- **One connection per username**: only one teammate can run the bot at a time per account
+- All `get_*`/`poll_*` calls read the client's local cache (cheap); only insert/amend/delete go over the network
+- **`poll_new_trades` / `poll_new_trade_ticks` / `poll_new_social_media_feeds` return each item once.** Only `Account`/`MarketData` call them; strategies read `ctx.fills`, `ctx.market.new_trades(id)`, `ctx.market.new_posts`
+- Every client method asserts the client is connected, so a disconnect raises `AssertionError`. The gateway and engine catch it
+- Sides `'bid'`/`'ask'`; order types `'limit'`/`'ioc'`; `amend_order` changes volume only (to change the price, delete and re-insert)
+- `get_tradable_instruments()` excludes expired/paused instruments; the gateway refuses orders on them
+- Instrument relationships: `instrument_type` (STOCK, STOCK_OPTION, STOCK_FUTURE, INDEX_TRACKING_ETF, INDEX_OPTION, INDEX_FUTURE), `base_instrument_id`, `strike`, `expiry`, `option_kind`, `index_constituents`, `etf_multiplier`, `etf_cash_comp`, `price_change_limit`
+- Exporter appends to `exports/<file>.csv` with a UTC timestamp first, capped at 2 GB
+- **To confirm at the tutorial** (placeholders in `settings.py`): position limits, message rate limit, scoring/valuation rule, whether the exchange rejects self-trades
